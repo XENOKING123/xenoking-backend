@@ -149,9 +149,12 @@ const MAX_PAGES = 40;
 // pageSize as a hard cap, so asking for a huge page pulls everything at once.
 const BIG_PAGE = 5000;
 // Pagination methods to probe if the site DOES cap the page (fallback only).
-// The sp* ones put paging into body.searchParameters — the channel the SRP
-// widget itself uses (its URL ?start=N params land there).
-const STRATEGIES = ['spStart', 'spStartArr', 'spPage', 'spPageNum', 'spOffset',
+// pageStart first: the widget echoes {pageSize, pageStart} in its pageInfo, so
+// pageStart is the API's own name for the offset (pageSize in preferences is
+// already honored — same channel). The sp* ones use body.searchParameters.
+const STRATEGIES = ['pageStart', 'pageStartString', 'pageString', 'ipPageStart', 'ipStart', 'ipPage',
+  'spPageStart', 'topPageStart',
+  'spStart', 'spStartArr', 'spPage', 'spPageNum', 'spOffset',
   'page', 'pageNum', 'pageNumber', 'pageNo', 'currentPage', 'pageIndex', 'start', 'offset', 'from', 'topStart', 'topPage'];
 
 function dealerList() {
@@ -195,6 +198,14 @@ function bodyFor(cfg, opts) {
     preferences: prefs, widgetName: 'ws-inv-data', windowId: 'inventory-data-bus2',
   };
   switch (strategy) {
+    case 'pageStart':       prefs.pageStart = offset; break;
+    case 'pageStartString': prefs.pageStart = String(offset); break;
+    case 'pageString':      prefs.page = String(page); break;
+    case 'ipPageStart':     body.inventoryParameters = { pageStart: String(offset) }; break;
+    case 'ipStart':         body.inventoryParameters = { start: String(offset) }; break;
+    case 'ipPage':          body.inventoryParameters = { page: String(page) }; break;
+    case 'spPageStart':  body.searchParameters = { pageStart: String(offset) }; break;
+    case 'topPageStart': body.pageStart = offset; break;
     case 'spStart':     body.searchParameters = { start: String(offset) }; break;
     case 'spStartArr':  body.searchParameters = { start: [String(offset)] }; break;
     case 'spPage':      body.searchParameters = { page: String(page) }; break;
@@ -362,18 +373,30 @@ function mapVehicle(v, cfg) {
 
 const vinOf = (v) => cleanVin(v && (v.vin || v.VIN || v.vinNumber));
 
-// Detect which pagination method the API honors by requesting "page 2" each way
-// (at the given page size) and seeing which returns DIFFERENT vehicles than
-// page 1. Returns the first method whose first VIN differs from page 1's.
-async function detectStrategy(cfg, firstVin, pageSize) {
-  const tests = await Promise.all(STRATEGIES.map((s) =>
-    fetchPage(cfg, { page: 2, pageSize, strategy: s }).then((r) => ({ s, r })).catch(() => ({ s, r: null }))));
-  for (const { s, r } of tests) {
-    const vs = r ? findVehicles(r) : [];
-    if (vs.length && vinOf(vs[0]) && vinOf(vs[0]) !== firstVin) return { strategy: s, page2: r };
-  }
-  return { strategy: null, page2: null };
+// Detect which pagination method the API honors by requesting "page 2" every
+// way at once and RACING: the first response whose vehicles differ from page 1
+// wins immediately — no waiting for the slow losers. Falls back to null only
+// after every probe has answered.
+function detectStrategy(cfg, firstVin, pageSize) {
+  return new Promise((resolve) => {
+    let pending = STRATEGIES.length;
+    let done = false;
+    const finish = (val) => { if (!done) { done = true; resolve(val); } };
+    for (const s of STRATEGIES) {
+      fetchPage(cfg, { page: 2, pageSize, strategy: s })
+        .then((r) => {
+          const vs = r ? findVehicles(r) : [];
+          if (vs.length && vinOf(vs[0]) && vinOf(vs[0]) !== firstVin) finish({ strategy: s, page2: r });
+        })
+        .catch(() => {})
+        .finally(() => { if (--pending === 0) finish({ strategy: null, page2: null }); });
+    }
+  });
 }
+
+// Remember which method worked per dealer (per process): after the first load,
+// later loads skip the probe entirely and page immediately.
+const KNOWN_STRATEGY = new Map();
 
 async function loadInventory(dealerKey, get, condition) {
   const cfg = applyCondition(resolveDealer(dealerKey, get), condition);
@@ -411,7 +434,18 @@ async function loadInventory(dealerKey, get, condition) {
   //     through using the pagination method the API actually honors.
   const cap = p1v.length || PAGE_SIZE;
   if (total > rows.length && cap > 0) {
-    const { strategy, page2 } = await detectStrategy(cfg, vinOf(p1v[0]), cap);
+    let strategy = KNOWN_STRATEGY.get(cfg.key) || null;
+    let page2 = null;
+    if (strategy) {
+      // Fast path: reuse the method that worked last time (verify it still moves).
+      page2 = await fetchPage(cfg, { page: 2, pageSize: cap, strategy }).catch(() => null);
+      const vs = page2 ? findVehicles(page2) : [];
+      if (!vs.length || vinOf(vs[0]) === vinOf(p1v[0])) { strategy = null; page2 = null; }
+    }
+    if (!strategy) {
+      ({ strategy, page2 } = await detectStrategy(cfg, vinOf(p1v[0]), cap));
+      if (strategy) KNOWN_STRATEGY.set(cfg.key, strategy);
+    }
     if (strategy) {
       absorb(page2);
       const pages = total ? Math.ceil(total / cap) : MAX_PAGES;
@@ -460,6 +494,7 @@ async function rawSample(dealerKey, get) {
     }
   }));
   const winner = probes.find((p) => p.differs);
+  if (winner) KNOWN_STRATEGY.set(cfg.key, winner.strategy);
 
   return {
     dealer: cfg.key,

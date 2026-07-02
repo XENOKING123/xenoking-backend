@@ -1,38 +1,23 @@
-# XENOKING — Update: Car/van fix + all-588 pagination
+# XENOKING backend — full lot + fast loading (final)
 
-Two separate fixes. The **extension** one is the important one you asked for.
+What this build does:
+- Pages your dealer API with `pageStart` (the parameter the server itself
+  names in every response), PLUS every method your other AI's system uses
+  (preferences.page as text, inventoryParameters) — 24 methods probed in a
+  RACE, first one that works wins instantly.
+- Remembers the winning method, so after the first load every "Load Vehicles"
+  goes straight to fetching pages: about 3 round trips for the whole lot.
+- All ~589 cars, deduped by VIN, with prices, miles, photos.
 
----
+## Deploy
+1. GitHub → xenoking-backend repo → Add file → Upload files → drop in
+   `server.js` (replace) → Commit. Render deploys itself (~2 min).
+2. Check https://xenoking-backend.onrender.com/api/debug/inventory-sample
+   → `workingPagination` should NOT say "NONE" anymore.
+3. Tool → Load Vehicles → ~589.
 
-## 1) Extension — fixes the Make problem (do this now)
-
-Facebook renamed the vehicle type from "Car/Truck" to **"Car/van"**, which is
-why the tool kept landing on "Other" and the Make box stayed empty. The tool
-now picks **Car/van** (and still works if Facebook shows the old name), so the
-Make dropdown appears and gets selected automatically like before.
-
-1. Chrome → `chrome://extensions`
-2. **Remove** XENOKING, then **Load unpacked** → pick the new `xenoking-extension` folder.
-3. Post a car — vehicle type should land on **Car/van** and Make should fill itself.
-
-Nothing else in the extension changed. Same login, same everything.
-
----
-
-## 2) Backend — gets you all 588 cars (one file swap, whenever you want)
-
-Your debug link showed Corwin caps every request at 100 and ignores all the
-normal "page 2" parameters. This build adds the paging channel the dealer
-website itself uses (searchParameters), plus a full probe report.
-
-1. GitHub repo → **Add file → Upload files** → drop in `server.js` from the
-   `xenoking-backend` folder (replace). Commit. Render auto-deploys.
-2. **Don't open/edit the file, don't accept Copilot suggestions.**
-3. After deploy, open:
-   `https://xenoking-backend.onrender.com/api/debug/inventory-sample`
-   - `workingPagination` should now say **spStart** (or another name — anything
-     but "NONE").
-   - Then hit **Load Vehicles** in the tool: Total Vehicles should be ~588.
-4. If it STILL says NONE, copy me the new `probes` list from that page — it now
-   shows exactly what the dealer API answered for every method, so I can nail
-   it in one look.
+## Why the first click of the day feels slow
+Render's free plan puts the server to sleep after ~15 min idle; the first
+request wakes it (30–60s). That's the hosting plan, not the tool — every
+click after that is fast. (Opening the side panel already wakes it up in
+the background, so by the time you log in and click Load it's usually warm.)
