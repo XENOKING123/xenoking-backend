@@ -149,7 +149,10 @@ const MAX_PAGES = 40;
 // pageSize as a hard cap, so asking for a huge page pulls everything at once.
 const BIG_PAGE = 5000;
 // Pagination methods to probe if the site DOES cap the page (fallback only).
-const STRATEGIES = ['page', 'pageNum', 'pageNumber', 'pageNo', 'currentPage', 'pageIndex', 'start', 'offset', 'from', 'topStart', 'topPage'];
+// The sp* ones put paging into body.searchParameters — the channel the SRP
+// widget itself uses (its URL ?start=N params land there).
+const STRATEGIES = ['spStart', 'spStartArr', 'spPage', 'spPageNum', 'spOffset',
+  'page', 'pageNum', 'pageNumber', 'pageNo', 'currentPage', 'pageIndex', 'start', 'offset', 'from', 'topStart', 'topPage'];
 
 function dealerList() {
   return Object.entries(DEALERS).map(([key, d]) => ({ key, label: d.label, configured: !!(d.base && d.siteId) }));
@@ -192,6 +195,11 @@ function bodyFor(cfg, opts) {
     preferences: prefs, widgetName: 'ws-inv-data', windowId: 'inventory-data-bus2',
   };
   switch (strategy) {
+    case 'spStart':     body.searchParameters = { start: String(offset) }; break;
+    case 'spStartArr':  body.searchParameters = { start: [String(offset)] }; break;
+    case 'spPage':      body.searchParameters = { page: String(page) }; break;
+    case 'spPageNum':   body.searchParameters = { pageNumber: String(page) }; break;
+    case 'spOffset':    body.searchParameters = { offset: String(offset) }; break;
     case 'page':        prefs.page = page; break;
     case 'pageNum':     prefs.pageNum = page; break;
     case 'pageNumber':  prefs.pageNumber = page; break;
@@ -428,18 +436,30 @@ async function rawSample(dealerKey, get) {
   const small = await fetchPage(cfg, { page: 1, pageSize: PAGE_SIZE });
   const total = findTotal(small);
   const v1 = findVehicles(small);
+  const firstVin = vinOf(v1[0]);
+  const cap = v1.length || PAGE_SIZE;
 
   // Does one big request return everything?
   const big = await fetchPage(cfg, { page: 1, pageSize: BIG_PAGE }).catch(() => null);
   const bigCount = big ? findVehicles(big).length : 0;
   const bigPageWorks = !!(total && bigCount >= total);
 
-  // If not, which pagination method actually changes the results?
-  let workingPagination = 'big-page';
-  if (!bigPageWorks) {
-    const { strategy } = await detectStrategy(cfg, vinOf(v1[0]), v1.length || PAGE_SIZE);
-    workingPagination = strategy || 'NONE (need to inspect)';
-  }
+  // Probe every pagination method for "page 2" and report what each returned —
+  // count, first VIN, whether it differs from page 1, and any pageInfo echo.
+  const PI_KEYS = ['totalCount', 'total', 'pageSize', 'pageStart', 'page', 'start', 'offset', 'currentPage', 'totalPages', 'pageNumber'];
+  const probes = await Promise.all(STRATEGIES.map(async (s) => {
+    try {
+      const r = await fetchPage(cfg, { page: 2, pageSize: cap, strategy: s });
+      const vs = findVehicles(r);
+      const echo = {};
+      const pi = r && r.pageInfo;
+      if (pi && typeof pi === 'object') for (const k of PI_KEYS) if (pi[k] != null) echo[k] = pi[k];
+      return { strategy: s, count: vs.length, firstVin: vinOf(vs[0]) || '', differs: !!(vs.length && vinOf(vs[0]) && vinOf(vs[0]) !== firstVin), pageInfo: echo };
+    } catch (e) {
+      return { strategy: s, error: String((e && e.message) || e) };
+    }
+  }));
+  const winner = probes.find((p) => p.differs);
 
   return {
     dealer: cfg.key,
@@ -447,7 +467,8 @@ async function rawSample(dealerKey, get) {
     page1Count: v1.length,
     bigPageCount: bigCount,
     bigPageWorks,
-    workingPagination,
+    workingPagination: bigPageWorks ? 'big-page' : (winner ? winner.strategy : 'NONE (need to inspect)'),
+    probes,
     firstVehicleMapped: v1[0] ? mapVehicle(v1[0], cfg) : null,
   };
 }

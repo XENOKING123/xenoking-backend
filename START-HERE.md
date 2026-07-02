@@ -1,81 +1,38 @@
-# XENOKING — Final Update (read this first)
+# XENOKING — Update: Car/van fix + all-588 pagination
 
-This fixes the two big problems and adds everything you asked for:
-**all 588 cars now load** (new + used), **prices show again**, plus a store
-dropdown, New/Used/Certified filter, working search, clean descriptions, and
-**bulk posting**.
-
-There are **two parts**. Do Part 1 first — the "only 100 cars / price not
-available" problem lives in the **backend**, so it won't go away until you
-redeploy it.
+Two separate fixes. The **extension** one is the important one you asked for.
 
 ---
 
-## Part 1 — Update the backend (fixes 588 cars + prices)
+## 1) Extension — fixes the Make problem (do this now)
 
-Your current server on Render is running old code. Replace it with the 3 files
-in **`xenoking-backend/`**:
+Facebook renamed the vehicle type from "Car/Truck" to **"Car/van"**, which is
+why the tool kept landing on "Other" and the Make box stayed empty. The tool
+now picks **Car/van** (and still works if Facebook shows the old name), so the
+Make dropdown appears and gets selected automatically like before.
 
-- `server.js`   ← the whole backend in ONE file (can't get scrambled)
-- `package.json`
-- `render.yaml`
+1. Chrome → `chrome://extensions`
+2. **Remove** XENOKING, then **Load unpacked** → pick the new `xenoking-extension` folder.
+3. Post a car — vehicle type should land on **Car/van** and Make should fill itself.
 
-### If you deploy from GitHub (what you've been doing)
-1. Open your GitHub repo → **Add file → Upload files**.
-2. Drag in `server.js` and `package.json` from the `xenoking-backend` folder,
-   replacing the old ones. (Upload `render.yaml` too if it's not there.)
-3. Commit. Render will **auto-deploy** in a couple minutes.
-4. **Do NOT open the files to "edit" them, and do not accept any Copilot / AI
-   suggestion** — that's what scrambled them last time. Just upload and commit.
-
-### Check it worked
-Open this link in your browser after it finishes deploying:
-
-```
-https://xenoking-backend.onrender.com/api/debug/inventory-sample
-```
-
-You want to see:
-- `"totalCount": 588` (or however many you have)
-- `"bigPageWorks": true`
-- `"firstVehicleMapped": { ... "Price": "29294 USD" ... }`  ← price is filled in
-
-If `bigPageWorks` is `false`, tell me the value of `workingPagination` from that
-page and I'll lock it in — but it should be `true`.
+Nothing else in the extension changed. Same login, same everything.
 
 ---
 
-## Part 2 — Update the extension
+## 2) Backend — gets you all 588 cars (one file swap, whenever you want)
 
-Use the **`xenoking-extension/`** folder.
+Your debug link showed Corwin caps every request at 100 and ignores all the
+normal "page 2" parameters. This build adds the paging channel the dealer
+website itself uses (searchParameters), plus a full probe report.
 
-1. Chrome → `chrome://extensions` → turn on **Developer mode** (top right).
-2. If XENOKING is already there, click **Remove** (this only clears the app, not
-   your online accounts — those live on the backend).
-3. Click **Load unpacked** → pick the `xenoking-extension` folder.
-4. Open the side panel and log in.
-
----
-
-## What's new in the tool
-
-- **Store dropdown** — Corwin Chrysler Dodge is live. Honda / Subaru / Toyota /
-  CPW show "coming soon" until you send me their inventory API details.
-- **Show: All / New / Used / Certified** — pick before you hit Load Vehicles.
-- **Search** actually filters now (type make, model, trim, VIN, price…).
-- **Load Vehicles** pulls the **whole lot** (all 588), with photos + prices.
-- **Bulk posting** — every car has a checkbox. Use **Select All** or tick the
-  ones you want, then **Post Selected**. It posts them one after another and
-  shows progress; **Stop** halts it. The **Delay** box (seconds) is the gap
-  between each listing — give yourself enough time to review/publish each one
-  before the next opens.
-- **Descriptions** are clean with emojis, price, mileage, drivetrain, engine and
-  colors. Anything you type in the description box gets included.
-- **Category** now defaults to **Car/Truck** (no more posting as "Other").
-
----
-
-## Owner controls (accounts)
-
-Same as before: sign-ups land as **pending**; approve / ban / block / set an
-access duration from the **Owner** tab. Only approved users can load or post.
+1. GitHub repo → **Add file → Upload files** → drop in `server.js` from the
+   `xenoking-backend` folder (replace). Commit. Render auto-deploys.
+2. **Don't open/edit the file, don't accept Copilot suggestions.**
+3. After deploy, open:
+   `https://xenoking-backend.onrender.com/api/debug/inventory-sample`
+   - `workingPagination` should now say **spStart** (or another name — anything
+     but "NONE").
+   - Then hit **Load Vehicles** in the tool: Total Vehicles should be ~588.
+4. If it STILL says NONE, copy me the new `probes` list from that page — it now
+   shows exactly what the dealer API answered for every method, so I can nail
+   it in one look.
