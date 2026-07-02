@@ -11,6 +11,7 @@ const rateLimit = require('express-rate-limit');
 
 const store = require('./db');
 const inventory = require('./inventory');
+const ai = require('./ai');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -182,41 +183,66 @@ app.get('/api/admin/settings', auth, ownerOnly, ah(async (_req, res) => {
   res.json({ ok: true, settings: await readConfig() });
 }));
 
-const DEALER_KEYS = ['dealerBase', 'dealerSiteId', 'dealerPageId', 'dealerPageAlias', 'dealerListingConfig', 'dealerPageSize', 'dealerPages'];
-
 app.post('/api/admin/settings', auth, ownerOnly, ah(async (req, res) => {
   if (typeof req.body.dataApiKey === 'string') await store.setSetting('dataApiKey', req.body.dataApiKey.trim());
   if (typeof req.body.dataApiBase === 'string') await store.setSetting('dataApiBase', req.body.dataApiBase.trim());
-  for (const k of DEALER_KEYS) {
-    if (typeof req.body[k] === 'string') await store.setSetting(k, String(req.body[k]).trim());
+  // Per-dealer overrides: keys like "dealer.corwin-honda.siteId".
+  for (const k of Object.keys(req.body || {})) {
+    if (/^dealer\.[a-z0-9-]+\.[a-zA-Z]+$/.test(k) && typeof req.body[k] === 'string') {
+      await store.setSetting(k, String(req.body[k]).trim());
+    }
   }
   res.json({ ok: true, settings: await readConfig() });
 }));
 
-// Load a sync snapshot of the dealer settings for the inventory module.
-async function dealerGetter() {
+// Load the override settings for one dealer as a sync getter.
+async function dealerGetter(dealerKey) {
+  const fields = ['base', 'siteId', 'pageId', 'pageAlias', 'listingConfig'];
   const map = {};
-  await Promise.all(DEALER_KEYS.map(async (k) => { map[k] = await store.getSetting(k); }));
+  await Promise.all(fields.map(async (f) => {
+    const k = `dealer.${dealerKey}.${f}`;
+    map[k] = await store.getSetting(k);
+  }));
   return (k) => (k in map ? map[k] : null);
 }
 
-// Approved users pull the dealer's whole inventory (server fetches it so the
+// The dropdown of dealerships the extension shows.
+app.get('/api/dealers', auth, requireApproved, (_req, res) => {
+  res.json({ ok: true, dealers: inventory.dealerList() });
+});
+
+// Approved users pull a dealer's whole inventory (server fetches it so the
 // Origin/Referer the dealer API requires are set correctly).
-app.get('/api/inventory', auth, requireApproved, ah(async (_req, res) => {
+app.get('/api/inventory', auth, requireApproved, ah(async (req, res) => {
+  const dealerKey = String(req.query.dealer || 'corwin-dodge');
+  const condition = String(req.query.condition || 'all');
   try {
-    const data = await inventory.loadInventory(await dealerGetter());
+    const data = await inventory.loadInventory(dealerKey, await dealerGetter(dealerKey), condition);
     res.json({ ok: true, ...data });
   } catch (e) {
     res.status(502).json({ error: 'inventory_failed', message: e.message });
   }
 }));
 
-// Owner debug: see the raw first vehicle so field mapping can be verified.
-app.get('/api/admin/inventory/raw', auth, ownerOnly, ah(async (_req, res) => {
+// Public debug: raw first vehicle so the exact dealer field names can be mapped.
+// (Dealer inventory is public data; safe to expose. Remove later if you like.)
+app.get('/api/debug/inventory-sample', ah(async (req, res) => {
+  const dealerKey = String(req.query.dealer || 'corwin-dodge');
   try {
-    res.json({ ok: true, ...(await inventory.rawSample(await dealerGetter())) });
+    res.json({ ok: true, ...(await inventory.rawSample(dealerKey, await dealerGetter(dealerKey))) });
   } catch (e) {
     res.status(502).json({ error: 'inventory_failed', message: e.message });
+  }
+}));
+
+// AI listing description (uses OWNER's OpenAI/Gemini key; falls back to template).
+app.post('/api/ai/describe', auth, requireApproved, ah(async (req, res) => {
+  try {
+    const text = await ai.describe(req.body && req.body.vehicle, req.body && req.body.instructions);
+    res.json({ ok: true, text });
+  } catch (e) {
+    const code = e.code === 'ai_disabled' ? 501 : 502;
+    res.status(code).json({ error: e.code || 'ai_failed', message: e.message });
   }
 }));
 
