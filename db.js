@@ -1,109 +1,86 @@
 'use strict';
 
-// Storage layer. Uses libSQL, which speaks two dialects of the same SQLite:
-//  - DATABASE_URL unset      -> a local file (./data/xenoking.db). Good for dev
-//                               and for servers with a persistent disk.
-//  - DATABASE_URL=libsql://… -> Turso (free cloud SQLite). Use this on hosts
-//                               with an ephemeral filesystem (e.g. Render free)
-//                               so the user list survives restarts/redeploys.
-const path = require('path');
-const fs = require('fs');
-const { createClient } = require('@libsql/client');
+// AI description generator. Uses OpenAI or Google Gemini, whichever key the
+// owner set (OPENAI_API_KEY or GEMINI_API_KEY). If neither is set, callers get
+// a 501 and the extension falls back to its built-in clean template.
 
-const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
-let url = DATABASE_URL;
-if (!url) {
-  const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
-  fs.mkdirSync(dataDir, { recursive: true });
-  url = 'file:' + path.join(dataDir, 'xenoking.db');
+const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
+const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+
+const enabled = () => !!(OPENAI_KEY || GEMINI_KEY);
+
+function buildPrompt(vehicle, instructions) {
+  const v = vehicle || {};
+  const facts = [
+    ['Year', v.Year], ['Make', v.Make], ['Model', v.Model], ['Trim', v.Trim],
+    ['Price', v.Price], ['Mileage', v['Mileage Value'] || v.MileageValue],
+    ['Exterior', v['Exterior Color'] || v.ExteriorColor], ['Interior', v['Interior Color'] || v.InteriorColor],
+    ['Drivetrain', v.Drivetrain], ['Transmission', v.Transmission], ['Engine', v.engine],
+    ['Fuel', v.fuel_type], ['VIN', v.VIN], ['Stock #', v.stock_number],
+  ].filter(([, val]) => val != null && String(val).trim() !== '')
+    .map(([k, val]) => `${k}: ${val}`).join('\n');
+
+  const style = (instructions && instructions.trim())
+    ? `The seller's style instructions (follow these closely):\n"${instructions.trim()}"`
+    : 'Keep it clean, friendly, and easy to read.';
+
+  return `You write short Facebook Marketplace car listings that sound human, not robotic.
+
+${style}
+
+Rules:
+- Sound natural and inviting, never corporate or spammy.
+- Use a few tasteful emojis (not every line).
+- ALWAYS include the price, mileage, and drivetrain if provided.
+- Mention 2-3 appealing things about the car in plain language.
+- Keep it to about 4-6 short lines. End with a simple call to action.
+- Do not invent facts that aren't in the data. No markdown headings.
+
+VEHICLE DATA:
+${facts}
+
+Write the listing description now.`;
 }
 
-const db = createClient({
-  url,
-  authToken: process.env.DATABASE_AUTH_TOKEN || undefined,
-});
-
-async function init() {
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS users (
-      id           INTEGER PRIMARY KEY AUTOINCREMENT,
-      email        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-      password     TEXT NOT NULL,
-      name         TEXT DEFAULT '',
-      role         TEXT NOT NULL DEFAULT 'user',   -- 'owner' | 'user'
-      status       TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'approved' | 'banned' | 'blocked'
-      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
-      last_login   TEXT,
-      expires_at   TEXT             -- NULL = unlimited access
-    )`);
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS settings (
-      key   TEXT PRIMARY KEY,
-      value TEXT
-    )`);
-  // Migrate older databases that predate the expires_at column.
-  try { await db.execute('ALTER TABLE users ADD COLUMN expires_at TEXT'); }
-  catch (e) { /* column already exists */ }
+async function viaOpenAI(prompt) {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.8,
+      max_tokens: 320,
+    }),
+    signal: AbortSignal.timeout(25000),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error && data.error.message || 'OpenAI error');
+  return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '').trim();
 }
 
-const one = (rs) => (rs.rows.length ? rs.rows[0] : undefined);
-const USER_COLS = 'id, email, name, role, status, created_at, updated_at, last_login, expires_at';
+async function viaGemini(prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.8, maxOutputTokens: 320 } }),
+    signal: AbortSignal.timeout(25000),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error && data.error.message || 'Gemini error');
+  const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+  return (parts && parts.map((p) => p.text).join('') || '').trim();
+}
 
-module.exports = {
-  db,
-  init,
-  storageLabel: DATABASE_URL ? 'cloud (libsql)' : url,
-  getUserByEmail: async (email) =>
-    one(await db.execute({ sql: 'SELECT * FROM users WHERE email = ? COLLATE NOCASE', args: [email] })),
-  getUserById: async (id) =>
-    one(await db.execute({ sql: 'SELECT * FROM users WHERE id = ?', args: [id] })),
-  createUser: async ({ email, password, name, role, status }) =>
-    db.execute({
-      sql: 'INSERT INTO users (email, password, name, role, status) VALUES (?, ?, ?, ?, ?)',
-      args: [email, password, name, role, status],
-    }),
-  listUsers: async () =>
-    (await db.execute(`SELECT ${USER_COLS} FROM users ORDER BY created_at DESC`)).rows,
-  // Set status; optionally set expiry too. Pass expiresAt === undefined to
-  // leave the expiry column untouched, or null to clear it (unlimited).
-  setUserStatus: async (id, status, expiresAt) => {
-    if (expiresAt === undefined) {
-      return db.execute({ sql: "UPDATE users SET status = ?, updated_at = datetime('now') WHERE id = ?", args: [status, id] });
-    }
-    return db.execute({
-      sql: "UPDATE users SET status = ?, expires_at = ?, updated_at = datetime('now') WHERE id = ?",
-      args: [status, expiresAt, id],
-    });
-  },
-  setExpiry: async (id, expiresAt) =>
-    db.execute({ sql: "UPDATE users SET expires_at = ?, updated_at = datetime('now') WHERE id = ?", args: [expiresAt, id] }),
-  markLogin: async (id) =>
-    db.execute({ sql: "UPDATE users SET last_login = datetime('now'), updated_at = datetime('now') WHERE id = ?", args: [id] }),
-  deleteUser: async (id) =>
-    db.execute({ sql: 'DELETE FROM users WHERE id = ?', args: [id] }),
-  getSetting: async (key) => {
-    const row = one(await db.execute({ sql: 'SELECT value FROM settings WHERE key = ?', args: [key] }));
-    return row ? row.value : null;
-  },
-  setSetting: async (key, value) =>
-    db.execute({
-      sql: 'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-      args: [key, value == null ? '' : String(value)],
-    }),
-  upsertOwner: async function ({ email, passwordHash, name }) {
-    const existing = await this.getUserByEmail(email);
-    if (existing) {
-      await db.execute({
-        sql: "UPDATE users SET password = ?, role = 'owner', status = 'approved', updated_at = datetime('now') WHERE id = ?",
-        args: [passwordHash, existing.id],
-      });
-      return this.getUserById(existing.id);
-    }
-    const info = await db.execute({
-      sql: "INSERT INTO users (email, password, name, role, status) VALUES (?, ?, ?, 'owner', 'approved')",
-      args: [email, passwordHash, name || 'Owner'],
-    });
-    return this.getUserById(Number(info.lastInsertRowid));
-  },
-};
+async function describe(vehicle, instructions) {
+  if (!enabled()) { const e = new Error('AI not configured'); e.code = 'ai_disabled'; throw e; }
+  const prompt = buildPrompt(vehicle, instructions);
+  const text = OPENAI_KEY ? await viaOpenAI(prompt) : await viaGemini(prompt);
+  if (!text) throw new Error('empty AI response');
+  return text;
+}
+
+module.exports = { describe, enabled };
