@@ -10,6 +10,7 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 
 const store = require('./db');
+const inventory = require('./inventory');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -181,10 +182,42 @@ app.get('/api/admin/settings', auth, ownerOnly, ah(async (_req, res) => {
   res.json({ ok: true, settings: await readConfig() });
 }));
 
+const DEALER_KEYS = ['dealerBase', 'dealerSiteId', 'dealerPageId', 'dealerPageAlias', 'dealerListingConfig', 'dealerPageSize', 'dealerPages'];
+
 app.post('/api/admin/settings', auth, ownerOnly, ah(async (req, res) => {
   if (typeof req.body.dataApiKey === 'string') await store.setSetting('dataApiKey', req.body.dataApiKey.trim());
   if (typeof req.body.dataApiBase === 'string') await store.setSetting('dataApiBase', req.body.dataApiBase.trim());
+  for (const k of DEALER_KEYS) {
+    if (typeof req.body[k] === 'string') await store.setSetting(k, String(req.body[k]).trim());
+  }
   res.json({ ok: true, settings: await readConfig() });
+}));
+
+// Load a sync snapshot of the dealer settings for the inventory module.
+async function dealerGetter() {
+  const map = {};
+  await Promise.all(DEALER_KEYS.map(async (k) => { map[k] = await store.getSetting(k); }));
+  return (k) => (k in map ? map[k] : null);
+}
+
+// Approved users pull the dealer's whole inventory (server fetches it so the
+// Origin/Referer the dealer API requires are set correctly).
+app.get('/api/inventory', auth, requireApproved, ah(async (_req, res) => {
+  try {
+    const data = await inventory.loadInventory(await dealerGetter());
+    res.json({ ok: true, ...data });
+  } catch (e) {
+    res.status(502).json({ error: 'inventory_failed', message: e.message });
+  }
+}));
+
+// Owner debug: see the raw first vehicle so field mapping can be verified.
+app.get('/api/admin/inventory/raw', auth, ownerOnly, ah(async (_req, res) => {
+  try {
+    res.json({ ok: true, ...(await inventory.rawSample(await dealerGetter())) });
+  } catch (e) {
+    res.status(502).json({ error: 'inventory_failed', message: e.message });
+  }
 }));
 
 // ---- Owner-only admin API ----
