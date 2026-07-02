@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: xenoking-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - { key: OWNER_EMAIL, sync: false }
+      - { key: OWNER_PASSWORD, sync: false }
+      - { key: JWT_SECRET, generateValue: true }
+      - { key: DATABASE_URL, sync: false }
+      - { key: DATABASE_AUTH_TOKEN, sync: false }
+      - { key: JWT_TTL, value: 7d }
