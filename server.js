@@ -86,6 +86,8 @@ module.exports = {
   },
   setExpiry: async (id, expiresAt) =>
     db.execute({ sql: "UPDATE users SET expires_at = ?, updated_at = datetime('now') WHERE id = ?", args: [expiresAt, id] }),
+  setRole: async (id, role) =>
+    db.execute({ sql: "UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?", args: [role, id] }),
   markLogin: async (id) =>
     db.execute({ sql: "UPDATE users SET last_login = datetime('now'), updated_at = datetime('now') WHERE id = ?", args: [id] }),
   deleteUser: async (id) =>
@@ -713,6 +715,15 @@ function ownerOnly(req, res, next) {
   next();
 }
 
+// Owner, or an ACTIVE admin (approved + not expired). Admins can manage regular
+// users; only the owner can manage admins, roles, and settings.
+function adminOnly(req, res, next) {
+  const u = req.user;
+  if (u.role === 'owner') return next();
+  if (u.role === 'admin' && u.status === 'approved' && !expiryInfo(u).expired) return next();
+  return res.status(403).json({ error: 'admin_only' });
+}
+
 // Centralized access gate: the owner is always allowed; everyone else must be
 // approved. Apply to any route that hands out capability so a future route
 // can't accidentally be reachable by a pending/banned/blocked account.
@@ -848,9 +859,22 @@ app.post('/api/ai/describe', auth, requireApproved, ah(async (req, res) => {
   }
 }));
 
-// ---- Owner-only admin API ----
-app.get('/api/admin/users', auth, ownerOnly, ah(async (_req, res) => {
+// ---- Admin API (owner + promoted admins) ----
+app.get('/api/admin/users', auth, adminOnly, ah(async (_req, res) => {
   res.json({ ok: true, users: (await store.listUsers()).map(publicUser) });
+}));
+
+// Role changes are the owner's alone: promote a user to admin or demote back.
+app.post('/api/admin/users/:id/role', auth, ownerOnly, ah(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(400).json({ error: 'bad_id' });
+  const role = String((req.body && req.body.role) || '');
+  if (role !== 'admin' && role !== 'user') return res.status(400).json({ error: 'bad_role' });
+  const target = await store.getUserById(id);
+  if (!target) return res.status(404).json({ error: 'not_found' });
+  if (target.role === 'owner') return res.status(400).json({ error: 'cannot_modify_owner' });
+  await store.setRole(id, role);
+  res.json({ ok: true, user: publicUser(await store.getUserById(id)) });
 }));
 
 const ACTIONS = {
@@ -861,13 +885,16 @@ const ACTIONS = {
   pending: 'pending',
 };
 
-app.post('/api/admin/users/:id/:action', auth, ownerOnly, ah(async (req, res) => {
+app.post('/api/admin/users/:id/:action', auth, adminOnly, ah(async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id < 1) return res.status(400).json({ error: 'bad_id' });
   const action = req.params.action;
   const target = await store.getUserById(id);
   if (!target) return res.status(404).json({ error: 'not_found' });
   if (target.role === 'owner') return res.status(400).json({ error: 'cannot_modify_owner' });
+  if (target.role === 'admin' && req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'owner_only', message: 'Only the owner can manage admins.' });
+  }
 
   if (action === 'delete') {
     await store.deleteUser(id);
@@ -896,6 +923,43 @@ app.post('/api/admin/users/:id/:action', auth, ownerOnly, ah(async (req, res) =>
   await store.setUserStatus(id, ACTIONS[action], action === 'approve' ? expiresAt : null);
   res.json({ ok: true, user: publicUser(await store.getUserById(id)) });
 }));
+
+// Privacy policy for the Chrome Web Store listing.
+app.get('/privacy', (_req, res) => {
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XENOKING Auto Lister — Privacy Policy</title>
+<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a2233}h1{font-size:1.6em}h2{font-size:1.15em;margin-top:1.6em}</style>
+</head><body>
+<h1>XENOKING Auto Lister — Privacy Policy</h1>
+<p>XENOKING Auto Lister is a browser extension that loads a dealership's vehicle
+inventory and prefills Facebook Marketplace vehicle listing forms.</p>
+<h2>What we collect</h2>
+<ul>
+<li><b>Account data:</b> your email address, display name, and a password (stored
+only as a bcrypt hash) — used solely to sign you in and let the tool owner
+manage access.</li>
+<li><b>Usage data:</b> which vehicles you have posted (VIN, title, price) so the
+tool can mark them as already listed.</li>
+</ul>
+<h2>What we do NOT do</h2>
+<ul>
+<li>We do not sell or share your data with third parties.</li>
+<li>We do not collect your Facebook credentials or read your Facebook messages.</li>
+<li>We do not track your browsing. The extension only acts on the Facebook
+listing pages you open and the dealer inventory you load.</li>
+</ul>
+<h2>Where data lives</h2>
+<p>Account data is stored on the tool's own backend server. Inventory data and
+posting history are stored locally in your browser (chrome.storage). Vehicle
+inventory itself is public dealership listing data.</p>
+<h2>Data removal</h2>
+<p>Ask the tool owner to delete your account at any time; this removes your
+account data from the backend. Uninstalling the extension removes all locally
+stored data.</p>
+<p>Questions: contact the extension publisher via the Chrome Web Store listing.</p>
+</body></html>`);
+});
 
 // Standalone web owner dashboard (optional convenience — same API as the
 // in-extension Owner tab).
