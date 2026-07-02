@@ -1,18 +1,13 @@
-// XENOKING backend — single-file build (db + inventory + ai + server combined).
-// Do NOT let any AI/Copilot 'refactor' this. It just needs to sit here as-is.
-
 'use strict';
 
-require('dotenv').config();
-
-const path = require('path');
-const express = require('express');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const rateLimit = require('express-rate-limit');
+// ===========================================================================
+//  XENOKING backend — SINGLE FILE build (do not edit by hand; run
+//  build-single.js). Assembled from db.js + inventory.js + ai.js + server.js.
+// ===========================================================================
 
 const store = (function () {
+  const module = { exports: {} };
+  let exports = module.exports;
 // Storage layer. Uses libSQL, which speaks two dialects of the same SQLite:
 //  - DATABASE_URL unset      -> a local file (./data/xenoking.db). Good for dev
 //                               and for servers with a persistent disk.
@@ -63,7 +58,7 @@ async function init() {
 const one = (rs) => (rs.rows.length ? rs.rows[0] : undefined);
 const USER_COLS = 'id, email, name, role, status, created_at, updated_at, last_login, expires_at';
 
-return {
+module.exports = {
   db,
   init,
   storageLabel: DATABASE_URL ? 'cloud (libsql)' : url,
@@ -121,8 +116,12 @@ return {
   },
 };
 
+  return module.exports;
 })();
+
 const inventory = (function () {
+  const module = { exports: {} };
+  let exports = module.exports;
 // Server-side inventory loader for Dealer.com "ws-inv-data" widget APIs.
 // Fetches inventory (with the Origin/Referer the API requires), auto-detects how
 // the API paginates, and maps each vehicle into the Facebook-catalog row shape
@@ -145,9 +144,12 @@ const DEALERS = {
 };
 const DEFAULT_DEALER = 'corwin-dodge';
 const PAGE_SIZE = 100;
-const MAX_PAGES = 20;
-// Pagination methods to probe (the widget API varies by site).
-const STRATEGIES = ['page', 'pageNum', 'pageNumber', 'start', 'offset', 'topStart'];
+const MAX_PAGES = 40;
+// One big request usually returns the whole lot: the Dealer.com widget honors
+// pageSize as a hard cap, so asking for a huge page pulls everything at once.
+const BIG_PAGE = 5000;
+// Pagination methods to probe if the site DOES cap the page (fallback only).
+const STRATEGIES = ['page', 'pageNum', 'pageNumber', 'pageNo', 'currentPage', 'pageIndex', 'start', 'offset', 'from', 'topStart', 'topPage'];
 
 function dealerList() {
   return Object.entries(DEALERS).map(([key, d]) => ({ key, label: d.label, configured: !!(d.base && d.siteId) }));
@@ -171,6 +173,8 @@ function applyCondition(cfg, condition) {
   const c = String(condition || '').toLowerCase();
   if (c === 'new') return { ...cfg, listingConfig: 'auto-new' };
   if (c === 'used' || c === 'preowned' || c === 'pre-owned') return { ...cfg, listingConfig: 'auto-used' };
+  // Certified are a subset of pre-owned — pull used, then keep only certified.
+  if (c === 'certified' || c === 'cpo') return { ...cfg, listingConfig: 'auto-used', certifiedOnly: true };
   return cfg;
 }
 
@@ -187,12 +191,20 @@ function bodyFor(cfg, opts) {
     pageAlias: cfg.pageAlias, pageId: cfg.pageId,
     preferences: prefs, widgetName: 'ws-inv-data', windowId: 'inventory-data-bus2',
   };
-  if (strategy === 'page') prefs.page = page;
-  else if (strategy === 'pageNum') prefs.pageNum = page;
-  else if (strategy === 'pageNumber') prefs.pageNumber = page;
-  else if (strategy === 'start') prefs.start = offset;
-  else if (strategy === 'offset') prefs.offset = offset;
-  else if (strategy === 'topStart') { body.start = offset; body.rows = pageSize; }
+  switch (strategy) {
+    case 'page':        prefs.page = page; break;
+    case 'pageNum':     prefs.pageNum = page; break;
+    case 'pageNumber':  prefs.pageNumber = page; break;
+    case 'pageNo':      prefs.pageNo = page; break;
+    case 'currentPage': prefs.currentPage = page; break;
+    case 'pageIndex':   prefs.pageIndex = page - 1; break;       // 0-based
+    case 'start':       prefs.start = offset; break;
+    case 'offset':      prefs.offset = offset; break;
+    case 'from':        prefs.from = offset; break;
+    case 'topStart':    body.start = offset; body.rows = pageSize; break;
+    case 'topPage':     body.page = page; break;
+    default:            prefs.page = page;
+  }
   return body;
 }
 
@@ -331,6 +343,7 @@ function mapVehicle(v, cfg) {
     fuel_type: cap(first(v, ['fuelType', 'fuel']) || A.normalFuelType || A.fuelType),
     stock_number: cap(first(v, ['stockNumber', 'stock']) || A.stockNumber),
     'State of Vehicle': state,
+    certified: !!v.certified || /certified|cpo/.test(cond),
     'Vehicle Id': cap(first(v, ['uuid', 'id', 'vehicleId']) || vin),
     vehicle_type: body,
     'Final Url': link && link.startsWith('http') ? link : (link ? cfg.base + link : ''),
@@ -342,10 +355,11 @@ function mapVehicle(v, cfg) {
 const vinOf = (v) => cleanVin(v && (v.vin || v.VIN || v.vinNumber));
 
 // Detect which pagination method the API honors by requesting "page 2" each way
-// and seeing which returns DIFFERENT vehicles than page 1.
-async function detectStrategy(cfg, firstVin) {
+// (at the given page size) and seeing which returns DIFFERENT vehicles than
+// page 1. Returns the first method whose first VIN differs from page 1's.
+async function detectStrategy(cfg, firstVin, pageSize) {
   const tests = await Promise.all(STRATEGIES.map((s) =>
-    fetchPage(cfg, { page: 2, strategy: s }).then((r) => ({ s, r })).catch(() => ({ s, r: null }))));
+    fetchPage(cfg, { page: 2, pageSize, strategy: s }).then((r) => ({ s, r })).catch(() => ({ s, r: null }))));
   for (const { s, r } of tests) {
     const vs = r ? findVehicles(r) : [];
     if (vs.length && vinOf(vs[0]) && vinOf(vs[0]) !== firstVin) return { strategy: s, page2: r };
@@ -370,51 +384,82 @@ async function loadInventory(dealerKey, get, condition) {
     return n;
   };
 
-  const p1 = await fetchPage(cfg, { page: 1 });
+  // --- Primary path: one big page. The widget caps results at pageSize, so a
+  //     huge pageSize returns the entire lot in a single request.
+  const p1 = await fetchPage(cfg, { page: 1, pageSize: BIG_PAGE });
   const total = findTotal(p1);
   const p1v = findVehicles(p1);
   absorb(p1);
-  let usedStrategy = 'single-page';
 
-  if (p1v.length >= PAGE_SIZE && (total === 0 || total > PAGE_SIZE)) {
-    const { strategy, page2 } = await detectStrategy(cfg, vinOf(p1v[0]));
+  // Single exit point: apply the certified sub-filter and shape the result.
+  const finish = (strategy) => {
+    const out = cfg.certifiedOnly ? rows.filter((r) => r.certified) : rows;
+    return { count: out.length, total: total || out.length, dealer: cfg.key, strategy, vehicles: out };
+  };
+
+  if (total && rows.length >= total) return finish('big-page');
+
+  // --- Fallback: the site capped the page. Whatever came back IS the cap; page
+  //     through using the pagination method the API actually honors.
+  const cap = p1v.length || PAGE_SIZE;
+  if (total > rows.length && cap > 0) {
+    const { strategy, page2 } = await detectStrategy(cfg, vinOf(p1v[0]), cap);
     if (strategy) {
-      usedStrategy = strategy;
       absorb(page2);
-      const pages = total > PAGE_SIZE ? Math.min(MAX_PAGES, Math.ceil(total / PAGE_SIZE)) : MAX_PAGES;
+      const pages = total ? Math.ceil(total / cap) : MAX_PAGES;
       const rest = [];
-      for (let p = 3; p <= pages; p++) rest.push(fetchPage(cfg, { page: p, strategy }).catch(() => null));
+      for (let p = 3; p <= Math.min(pages, MAX_PAGES); p++) {
+        rest.push(fetchPage(cfg, { page: p, pageSize: cap, strategy }).catch(() => null));
+      }
       for (const r of await Promise.all(rest)) absorb(r);
-    } else {
-      // No page method worked — try one big request.
-      usedStrategy = 'bigPageSize';
-      const big = await fetchPage(cfg, { page: 1, pageSize: Math.min(2000, total || 2000), strategy: 'page' }).catch(() => null);
-      absorb(big);
+      return finish(strategy);
     }
   }
 
-  return { count: rows.length, total: total || rows.length, dealer: cfg.key, strategy: usedStrategy, vehicles: rows };
+  return finish('single-page');
 }
 
+// Public diagnostic: probe the real API and report exactly how it behaves, so a
+// single hit on /api/debug/inventory-sample tells us what works.
 async function rawSample(dealerKey, get) {
   const cfg = resolveDealer(dealerKey, get);
   if (!cfg.base || !cfg.siteId) throw new Error(`Dealer "${cfg.key}" isn't set up yet.`);
-  const p1 = await fetchPage(cfg, { page: 1 });
-  const v1 = findVehicles(p1);
-  const { strategy } = await detectStrategy(cfg, vinOf(v1[0]));
+
+  const small = await fetchPage(cfg, { page: 1, pageSize: PAGE_SIZE });
+  const total = findTotal(small);
+  const v1 = findVehicles(small);
+
+  // Does one big request return everything?
+  const big = await fetchPage(cfg, { page: 1, pageSize: BIG_PAGE }).catch(() => null);
+  const bigCount = big ? findVehicles(big).length : 0;
+  const bigPageWorks = !!(total && bigCount >= total);
+
+  // If not, which pagination method actually changes the results?
+  let workingPagination = 'big-page';
+  if (!bigPageWorks) {
+    const { strategy } = await detectStrategy(cfg, vinOf(v1[0]), v1.length || PAGE_SIZE);
+    workingPagination = strategy || 'NONE (need to inspect)';
+  }
+
   return {
     dealer: cfg.key,
-    totalCount: findTotal(p1),
+    totalCount: total,
     page1Count: v1.length,
-    workingPagination: strategy || 'NONE (need to inspect)',
+    bigPageCount: bigCount,
+    bigPageWorks,
+    workingPagination,
     firstVehicleMapped: v1[0] ? mapVehicle(v1[0], cfg) : null,
   };
 }
 
-return { loadInventory, rawSample, dealerList, mapVehicle, DEALERS };
+module.exports = { loadInventory, rawSample, dealerList, mapVehicle, DEALERS };
 
+  return module.exports;
 })();
+
 const ai = (function () {
+  const module = { exports: {} };
+  let exports = module.exports;
 // AI description generator. Uses OpenAI or Google Gemini, whichever key the
 // owner set (OPENAI_API_KEY or GEMINI_API_KEY). If neither is set, callers get
 // a 501 and the extension falls back to its built-in clean template.
@@ -498,9 +543,21 @@ async function describe(vehicle, instructions) {
   return text;
 }
 
-return { describe, enabled };
+module.exports = { describe, enabled };
 
+  return module.exports;
 })();
+
+// ---------------------------------------------------------------------------
+//  server
+// ---------------------------------------------------------------------------
+try { require('dotenv').config(); } catch (e) { /* no .env in prod */ }
+const path = require('path');
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
 // ---------------------------------------------------------------------------
 // Config
