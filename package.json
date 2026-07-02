@@ -1,7 +1,7 @@
 {
   "name": "xenoking-backend",
   "version": "1.0.0",
-  "description": "XENOKING Auto Lister backend",
+  "description": "XENOKING Auto Lister \u2014 accounts + owner-approval backend",
   "type": "commonjs",
   "main": "server.js",
   "scripts": {
